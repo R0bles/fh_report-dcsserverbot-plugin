@@ -701,7 +701,7 @@ class FH_Report(Plugin):
                         pass
                 if instance_home:
                     merged["saves_dir"] = os.path.join(instance_home, "Missions", "Saves")
-                    self.log.info(f"FH_Report [{name}]: saves_dir resolved to {merged['saves_dir']}")
+                    self.log.debug(f"FH_Report [{name}]: saves_dir resolved to {merged['saves_dir']}")
                 else:
                     self.log.warning(
                         f"FH_Report [{name}]: saves_dir not set and instance '{name}' not found in DCSSB. "
