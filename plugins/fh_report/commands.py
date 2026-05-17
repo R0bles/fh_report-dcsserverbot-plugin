@@ -662,6 +662,8 @@ class FH_Report(Plugin):
         super().__init__(bot, eventlistener)
         self._message_ids: dict = {}
         self._cycle_index: dict = {}  # tracks points_order cycle position per server
+        self._last_update: float = 0.0    # timestamp of last successful update cycle
+        self._post_sleep_reset: bool = False  # flag to discard burst after suspension
         self._message_ids_file: str = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "message_ids.json"
         )
@@ -754,6 +756,27 @@ class FH_Report(Plugin):
 
     @tasks.loop(seconds=300)
     async def updater(self):
+        import time
+        now = time.monotonic()
+        interval = min(
+            int(cfg.get("update_interval") or 300)
+            for cfg in self._servers.values()
+        ) if self._servers else 300
+        elapsed = now - self._last_update if self._last_update > 0 else interval
+
+        # Detect suspension: elapsed >> configured interval
+        if self._last_update > 0 and elapsed > interval * 1.5:
+            self._last_update = now
+            self._post_sleep_reset = True
+            return  # skip this burst iteration
+
+        # Discard rapid burst iterations after sleep reset
+        if self._post_sleep_reset and elapsed < 10:
+            return
+
+        self._post_sleep_reset = False
+        self._last_update = now
+
         for server_name, cfg in self._servers.items():
             try:
                 await self._update_server(server_name, cfg)
