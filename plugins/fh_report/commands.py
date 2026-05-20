@@ -6,7 +6,6 @@ with front-line status and pilot leaderboard. No database required.
 
 from __future__ import annotations
 
-import glob
 import logging
 import os
 import re
@@ -15,7 +14,7 @@ from typing import Type
 
 import discord
 from discord.ext import tasks
-from core import Plugin, TEventListener
+from core import Plugin, TEventListener, utils
 from services.bot import DCSServerBot
 
 
@@ -45,27 +44,42 @@ def get_rank(credits: float) -> str:
     return RANK_NAMES[rank_idx]
 
 
-def find_persistence_file(saves_dir: str) -> str | None:
+async def find_persistence_file(saves_dir: str, node) -> str | None:
     """Read the active Foothold persistence file path from foothold.status.
-    Falls back to most recently modified foothold_*.lua if status file not found."""
+    Falls back to most recently modified foothold_*.lua if status file not found.
+    Uses server.node.read_file() / list_directory() to support remote nodes in
+    a DCSSB cluster (Master reads files from agent disks transparently)."""
     status_file = os.path.join(saves_dir, "foothold.status")
-    if os.path.exists(status_file):
-        with open(status_file, "r", encoding="utf-8") as f:
-            path = f.read().strip().replace("/", os.sep)
-        if os.path.exists(path):
+    try:
+        data = await node.read_file(status_file)
+        path = data.decode("utf-8").strip()
+        path = os.path.normpath(path)
+        try:
+            await node.read_file(path)
             return path
-    # Fallback
-    candidates = glob.glob(os.path.join(saves_dir, "foothold_*.lua"))
-    candidates = [f for f in candidates if "rank" not in os.path.basename(f).lower()]
-    if not candidates:
+        except FileNotFoundError:
+            pass
+    except FileNotFoundError:
+        pass
+    # Fallback: list directory and find foothold_*.lua candidates
+    try:
+        entries = await node.list_directory(saves_dir)
+        candidates = [
+            os.path.join(saves_dir, e) for e in entries
+            if e.lower().startswith("foothold_") and e.lower().endswith(".lua")
+            and "rank" not in e.lower()
+        ]
+        if not candidates:
+            return None
+        return sorted(candidates)[-1]
+    except Exception:
         return None
-    return max(candidates, key=os.path.getmtime)
 
 
-def parse_zones(filepath: str) -> dict:
+async def parse_zones(filepath: str, node) -> dict:
     """Parse zone persistence file. Returns {'blue': [...], 'red': [...]}."""
-    with open(filepath, "r", encoding="utf-8") as f:
-        content = f.read()
+    data = await node.read_file(filepath)
+    content = data.decode("utf-8")
 
     zones = {"blue": [], "red": [], "neutral": 0}
     zone_names = [
@@ -136,12 +150,12 @@ def parse_zones(filepath: str) -> dict:
     return zones
 
 
-def parse_player_stats(filepath: str) -> dict:
+async def parse_player_stats(filepath: str, node) -> dict:
     """Parse playerStats from Foothold persistence file.
     Returns dict {player_name: campaign_points}."""
     try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            content = f.read()
+        data = await node.read_file(filepath)
+        content = data.decode("utf-8")
         stats_match = re.search(
             r"zonePersistance\[[\"']playerStats[\"']\] = \{(.*?)^\}",
             content, re.DOTALL | re.MULTILINE
@@ -159,11 +173,11 @@ def parse_player_stats(filepath: str) -> dict:
         return {}
 
 
-def parse_ranks(filepath: str, excluded_ucids: list[str]) -> dict:
+async def parse_ranks(filepath: str, excluded_ucids: list[str], node) -> dict:
     """Parse Foothold_Ranks.lua. Returns pilot dict sorted by credits desc.
     Pilots whose UCID is in excluded_ucids are omitted."""
-    with open(filepath, "r", encoding="utf-8") as f:
-        content = f.read()
+    data = await node.read_file(filepath)
+    content = data.decode("utf-8")
     # Build set of excluded player names from ucidToName table
     excluded_names: set[str] = set()
     for ucid in excluded_ucids:
@@ -651,22 +665,23 @@ _fh_hook, _HAS_HOOK = _load_hook()
 
 # ── Plugin class ──────────────────────────────────────────────────────────────
 
-
-# ── Plugin class ──────────────────────────────────────────────────────────────
-
 class FH_Report(Plugin):
     """DCSServerBot plugin — posts Foothold campaign status to Discord.
-    Supports multiple server instances defined in fh_report.yaml."""
+    Supports multiple server instances defined in fh_report.yaml.
+    Uses server.node.read_file() so it works transparently in multi-node
+    clusters — only the Master runs plugin code; files are fetched from
+    agent nodes via the DCSSB RPC bus, exactly like the Pretense plugin."""
 
     def __init__(self, bot: DCSServerBot, eventlistener: Type[TEventListener] = None):
         super().__init__(bot, eventlistener)
         self._message_ids: dict = {}
-        self._cycle_index: dict = {}  # tracks points_order cycle position per server
+        self._cycle_index: dict = {}
+        self._last_update: float = 0.0
+        self._post_sleep_reset: bool = False
         self._message_ids_file: str = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "message_ids.json"
         )
-        self._servers: dict = {}
-        self._default_cfg: dict = {}
+
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
@@ -676,59 +691,16 @@ class FH_Report(Plugin):
 
     async def cog_load(self) -> None:
         await super().cog_load()
-        # Use self.locals to access the raw yaml before DCSSB processes DEFAULT
-        raw = self.locals or {}
-        self._default_cfg = raw.get("DEFAULT") or {}
         self._message_ids = self._load_message_ids()
-
-        # Build per-server configs merging DEFAULT values
-        for name, srv_cfg in raw.items():
-            if name == "DEFAULT" or not isinstance(srv_cfg, dict):
-                continue
-            merged = dict(self._default_cfg)
-            merged.update(srv_cfg)
-
-            # ── Resolve saves_dir from instance if not manually set ───────
-            if not merged.get("saves_dir"):
-                # Look up the DCSSB server object by instance name
-                instance_home = None
-                for server in self.bot.servers.values():
-                    try:
-                        if server.instance.name == name:
-                            instance_home = server.instance.home
-                            break
-                    except AttributeError:
-                        pass
-                if instance_home:
-                    merged["saves_dir"] = os.path.join(instance_home, "Missions", "Saves")
-                    self.log.info(f"FH_Report [{name}]: saves_dir resolved to {merged['saves_dir']}")
-                else:
-                    self.log.warning(
-                        f"FH_Report [{name}]: saves_dir not set and instance '{name}' not found in DCSSB. "
-                        f"Please set saves_dir manually in fh_report.yaml."
-                    )
-
-            self._servers[name] = merged
-
-        if not self._servers:
-            self.log.warning("FH_Report: no servers configured.")
+        # Set interval from DEFAULT if configured, then start the loop
+        raw      = self.locals or {}
+        interval = (raw.get("DEFAULT") or {}).get("update_interval", 300)
+        self.updater.change_interval(seconds=int(interval))
+        utils.safe_start(self.updater)
 
     async def cog_unload(self) -> None:
-        if self.updater.is_running():
-            self.updater.cancel()
+        await utils.safe_cancel(self.updater)
         await super().cog_unload()
-
-    async def on_ready(self) -> None:
-        await super().on_ready()
-        if not self._servers:
-            return
-        interval = min(
-            int(cfg.get("update_interval") or 300)
-            for cfg in self._servers.values()
-        )
-        self.updater.change_interval(seconds=interval)
-        if not self.updater.is_running():
-            self.updater.start()
 
     # ── Message IDs persistence (JSON file, no DB) ─────────────────────────
 
@@ -754,29 +726,59 @@ class FH_Report(Plugin):
 
     @tasks.loop(seconds=300)
     async def updater(self):
-        for server_name, cfg in self._servers.items():
+        import time
+        now = time.monotonic()
+        # Anti-burst: detect PC suspension (elapsed >> interval)
+        interval = self.updater.seconds or 300
+        elapsed  = now - self._last_update if self._last_update > 0 else interval
+        if self._last_update > 0 and elapsed > interval * 1.5:
+            self._last_update = now
+            self._post_sleep_reset = True
+            return
+        if self._post_sleep_reset and elapsed < 10:
+            return
+        self._post_sleep_reset = False
+        self._last_update = now
+
+        raw          = self.locals or {}
+        default_cfg  = raw.get("DEFAULT") or {}
+
+        # Iterate all DCSSB servers — same pattern as Pretense.
+        # Config is looked up by instance name (the key used in fh_report.yaml)
+        # rather than server.name (the long DCS display name), so existing yaml
+        # configs require no changes.
+        for server in self.bot.servers.values():
             try:
-                await self._update_server(server_name, cfg)
+                instance_name = server.instance.name
+                srv_cfg = raw.get(instance_name)
+                if not srv_cfg:
+                    continue
+                # Merge DEFAULT + instance overrides fresh each cycle (like Pretense)
+                cfg = dict(default_cfg)
+                cfg.update(srv_cfg)
+                await self._update_server(server, cfg)
             except Exception as e:
-                self.log.error(f"FH_Report [{server_name}]: unexpected error: {e}", exc_info=True)
+                self.log.error(
+                    f"FH_Report [{server.instance.name}]: unexpected error: {e}", exc_info=True
+                )
+
+    @updater.before_loop
+    async def before_updater(self):
+        await self.bot.wait_until_ready()
 
     def _resolve_points_order(self, server_name: str, cfg: dict) -> str:
-        """Parse points_order from config — supports comma-separated cycle list.
-        Returns the current value and advances the cycle index for next call."""
-        raw = str(cfg.get("points_order") or "R").strip()
-        # Parse comma-separated list
+        """Parse points_order — supports comma-separated cycle list."""
+        raw   = str(cfg.get("points_order") or "R").strip()
         items = [x.strip() for x in raw.split(",") if x.strip()]
         if len(items) <= 1:
             return items[0] if items else "R"
-        # Cycle through items
-        idx = self._cycle_index.get(server_name, 0)
+        idx   = self._cycle_index.get(server_name, 0)
         value = items[idx % len(items)]
         self._cycle_index[server_name] = (idx + 1) % len(items)
         return value
 
     async def _fetch_punishment_points(self) -> dict:
-        """Fetch total punishment points per UCID from pu_events table.
-        Returns empty dict if table doesn't exist or any error occurs."""
+        """Fetch total punishment points per UCID from pu_events table."""
         try:
             async with self.apool.connection() as conn:
                 async with conn.cursor() as cur:
@@ -792,86 +794,99 @@ class FH_Report(Plugin):
             self.log.debug(f"FH_Report: punishment points not available: {e}")
             return {}
 
-    async def _update_server(self, server_name: str, cfg: dict):
-        channel_id = cfg.get("channel_id")
-        saves_dir  = cfg.get("saves_dir")
-        if not channel_id or not saves_dir:
-            self.log.warning(f"FH_Report [{server_name}]: channel_id or saves_dir not configured.")
+    async def _update_server(self, server, cfg: dict):
+        """Update the Discord embed for one server instance.
+        server  — DCSSB Server object (provides server.node.read_file())
+        cfg     — merged config dict (DEFAULT + instance overrides)
+        Mirrors the Pretense pattern: read files via server.node.read_file()
+        so the Master transparently fetches data from remote agent nodes."""
+
+        instance_name = server.instance.name
+        channel_id    = cfg.get("channel_id")
+        if not channel_id:
+            self.log.warning(f"FH_Report [{instance_name}]: channel_id not configured.")
             return
 
         channel = self.bot.get_channel(int(channel_id))
         if not channel:
-            self.log.warning(f"FH_Report [{server_name}]: channel {channel_id} not found.")
+            self.log.warning(f"FH_Report [{instance_name}]: channel {channel_id} not found.")
             return
 
-        persistence_file = find_persistence_file(saves_dir)
+        # Resolve saves_dir — prefer explicit config, fall back to get_missions_dir()
+        # exactly as Pretense does: os.path.join(await server.get_missions_dir(), 'Saves')
+        saves_dir = cfg.get("saves_dir")
+        if not saves_dir:
+            saves_dir = os.path.join(await server.get_missions_dir(), "Saves")
+
+        node = server.node
+
+        persistence_file = await find_persistence_file(saves_dir, node)
         if not persistence_file:
-            self.log.warning(f"FH_Report [{server_name}]: no foothold_*.lua found in {saves_dir}")
+            self.log.warning(f"FH_Report [{instance_name}]: no foothold_*.lua found in {saves_dir}")
             return
 
         ranks_file = os.path.join(saves_dir, "Foothold_Ranks.lua")
-        if not os.path.exists(ranks_file):
-            self.log.warning(f"FH_Report [{server_name}]: Foothold_Ranks.lua not found in {saves_dir}")
+        try:
+            await node.read_file(ranks_file)
+        except FileNotFoundError:
+            self.log.warning(f"FH_Report [{instance_name}]: Foothold_Ranks.lua not found in {saves_dir}")
             return
 
         try:
             excluded_ucids = cfg.get("excluded_ucids") or []
-            zones          = parse_zones(persistence_file)
-            players        = parse_ranks(ranks_file, excluded_ucids)
-            campaign_stats = parse_player_stats(persistence_file)
+            zones          = await parse_zones(persistence_file, node)
+            players        = await parse_ranks(ranks_file, excluded_ucids, node)
+            campaign_stats = await parse_player_stats(persistence_file, node)
         except Exception as e:
-            self.log.error(f"FH_Report [{server_name}]: error parsing data: {e}")
+            self.log.error(f"FH_Report [{instance_name}]: error parsing data: {e}")
             return
 
-        # ── Optional private hook — post-processes players dict ───────────────
+        # Optional private hook — post-processes players dict
         if _HAS_HOOK:
             try:
-                players = _fh_hook.post_process(players, cfg, server_name, campaign_stats)
+                players = _fh_hook.post_process(players, cfg, instance_name, campaign_stats)
             except Exception:
-                pass  # Hook errors are silently ignored
+                pass
 
-        # Fetch punishment points if enabled
-        show_punishment = int(cfg.get("show_punishment") or 0)
+        show_punishment   = int(cfg.get("show_punishment") or 0)
         punishment_points = {}
         if show_punishment:
             punishment_points = await self._fetch_punishment_points()
 
         embed = build_embed(
-            zones             = zones,
-            players           = players,
-            campaign_name     = cfg.get("campaign_name", "Foothold Campaign"),
-            max_zones         = cfg.get("max_zones") or None,
-            max_pilots        = cfg.get("max_pilots") or None,
-            bar_length        = int(cfg.get("bar_length") or 20),
-            slot_status       = int(cfg.get("slot_status") or 0),
-            punishment_points = punishment_points,
-            show_punishment   = show_punishment,
+            zones               = zones,
+            players             = players,
+            campaign_name       = cfg.get("campaign_name", "Foothold Campaign"),
+            max_zones           = cfg.get("max_zones") or None,
+            max_pilots          = cfg.get("max_pilots") or None,
+            bar_length          = int(cfg.get("bar_length") or 20),
+            slot_status         = int(cfg.get("slot_status") or 0),
+            punishment_points   = punishment_points,
+            show_punishment     = show_punishment,
             show_all_pilots     = int(cfg.get("show_all_pilots") or 0),
             strip_callsign_flag = int(cfg.get("strip_callsign") or 0),
             zone_name_length    = max(8, min(24, int(cfg.get("zone_name_length") or 16))),
             max_pilots_2t       = cfg.get("max_pilots_2t") or None,
             campaign_stats      = campaign_stats,
-            points_order        = self._resolve_points_order(server_name, cfg),
+            points_order        = self._resolve_points_order(instance_name, cfg),
         )
 
         try:
-            msg_id = self._message_ids.get(server_name)
+            msg_id = self._message_ids.get(instance_name)
             if msg_id:
                 try:
                     msg = await channel.fetch_message(msg_id)
                     await msg.edit(embed=embed)
                     return
                 except discord.NotFound:
-                    self.log.warning(f"FH_Report [{server_name}]: previous message not found, posting new one.")
-                    self._message_ids.pop(server_name, None)
+                    self.log.warning(f"FH_Report [{instance_name}]: previous message not found, posting new one.")
+                    self._message_ids.pop(instance_name, None)
 
             msg = await channel.send(embed=embed)
-            self._message_ids[server_name] = msg.id
+            self._message_ids[instance_name] = msg.id
             self._save_message_ids()
 
         except discord.HTTPException as e:
-            self.log.error(f"FH_Report [{server_name}]: Discord error: {e}")
-
-
+            self.log.error(f"FH_Report [{instance_name}]: Discord error: {e}")
 async def setup(bot: DCSServerBot):
     await bot.add_cog(FH_Report(bot))
