@@ -15,8 +15,8 @@ HEADER_COMMENT = """# fh_report.yaml — FH_Report Plugin Configuration
 #
 # SERVER IDENTIFICATION:
 #   Each server block key must match the DCSServerBot instance name as defined in nodes.yaml.
-#   The plugin uses this name to automatically resolve the Foothold saves directory:
-#     {instance.home}\\Missions\\Saves
+#   The plugin resolves the Foothold saves directory automatically, including in multi-node
+#   cluster setups where DCS instances run on remote agent nodes.
 #   If Foothold saves are in a non-standard location, override with saves_dir.
 #
 # REQUIRED per server:
